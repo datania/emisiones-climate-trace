@@ -5,7 +5,7 @@
 setup: .uv
 	uv sync
 
-download: .uv
+data: .uv
 	uv run download-raw-data.py
 
 upload:
