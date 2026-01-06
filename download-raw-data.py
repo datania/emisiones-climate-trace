@@ -1,9 +1,15 @@
+import csv
 import shutil
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import BinaryIO
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+import pyarrow as pa
+import pyarrow.csv as pc
+import pyarrow.parquet as pq
 
 COUNTRY = "ESP"
 BASE_HOST = "https://downloads.climatetrace.org"
@@ -25,6 +31,7 @@ DATASETS: tuple[str, ...] = (
 )
 OUTPUT_ROOT = Path("data/raw")
 REQUEST_TIMEOUT = 30
+PARQUET_COMPRESSION = "zstd"
 
 
 def format_version(version: tuple[int, int, int]) -> str:
@@ -85,13 +92,74 @@ def fetch_zip(url: str, destination: Path) -> None:
         shutil.copyfileobj(response, fp)
 
 
-def extract_zip(zip_path: Path, target_dir: Path) -> None:
-    """Extract all files from zip_path into target_dir."""
+def guess_column_types(csv_stream: BinaryIO) -> dict[str, pa.DataType]:
+    position = csv_stream.tell()
+    header_line = csv_stream.readline()
+    csv_stream.seek(position)
+    if not header_line:
+        return {}
+    header_text = header_line.decode("utf-8", errors="replace")
+    columns = next(csv.reader([header_text]))
+    return {name: pa.string() for name in columns}
+
+
+def stream_csv_to_parquet(csv_stream: BinaryIO, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    column_types = guess_column_types(csv_stream)
+    convert_options = pc.ConvertOptions(
+        strings_can_be_null=True,
+        column_types=column_types or None,
+    )
+    reader = pc.open_csv(
+        csv_stream,
+        read_options=pc.ReadOptions(block_size=1 << 20),
+        convert_options=convert_options,
+    )
+    writer: pq.ParquetWriter | None = None
+    for batch in reader:
+        table = pa.Table.from_batches([batch])
+        if writer is None:
+            writer = pq.ParquetWriter(
+                target_path,
+                table.schema,
+                compression=PARQUET_COMPRESSION,
+            )
+        writer.write_table(table)
+    if writer is None:
+        empty = pa.Table.from_arrays([], schema=reader.schema)
+        pq.write_table(empty, target_path, compression=PARQUET_COMPRESSION)
+        return
+    writer.close()
+
+
+def extract_binary(
+    zf: zipfile.ZipFile, member: zipfile.ZipInfo, target_path: Path
+) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with zf.open(member) as src, target_path.open("wb") as dst:
+        shutil.copyfileobj(src, dst)
+
+
+def convert_zip_to_parquet(zip_path: Path, target_dir: Path) -> None:
     if target_dir.exists():
         shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(target_dir)
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            rel_path = Path(member.filename)
+            if (
+                rel_path.parts
+                and rel_path.parts[0] == "DATA"
+                and rel_path.suffix.lower() == ".csv"
+            ):
+                parquet_path = target_dir / rel_path.with_suffix(".parquet")
+                with zf.open(member) as csv_stream:
+                    stream_csv_to_parquet(csv_stream, parquet_path)
+                continue
+            target_path = target_dir / rel_path
+            extract_binary(zf, member, target_path)
 
 
 def download_dataset(dataset: str, base_url: str) -> None:
@@ -101,7 +169,7 @@ def download_dataset(dataset: str, base_url: str) -> None:
     with TemporaryDirectory() as tmp_dir:
         tmp_zip = Path(tmp_dir) / f"{COUNTRY}.zip"
         fetch_zip(url, tmp_zip)
-        extract_zip(tmp_zip, target_dir)
+        convert_zip_to_parquet(tmp_zip, target_dir)
     print(f"✓ {dataset}")
 
 
