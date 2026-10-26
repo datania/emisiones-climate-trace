@@ -9,11 +9,10 @@ data: .uv
 	uv run download-raw-data.py
 
 upload:
-	uvx --from "huggingface_hub[hf_xet]" hf upload-large-folder \
+	uvx --from "huggingface_hub[hf_xet]" hf upload \
 		--token=${HUGGINGFACE_TOKEN} \
 		--repo-type dataset \
-		--num-workers 1 \
-		datania/climate-trace data/
+		datania/climate-trace data/ .
 
 clean:
 	rm -rf data/
